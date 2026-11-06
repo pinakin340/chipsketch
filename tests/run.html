@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ChipSketch check-engine tests</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; }
+    .fail { color: #b3261e; font-weight: 600; }
+    .pass { color: #0b6660; }
+  </style>
+</head>
+<body>
+  <h1 id="summary">Running…</h1>
+  <ul id="out"></ul>
+  <script src="../js/knowledge.js"></script>
+  <script src="../js/model.js"></script>
+  <script src="../js/layout.js"></script>
+  <script src="../js/checks.js"></script>
+  <script src="../js/verilog.js"></script>
+  <script>
+    const results = [];
+    function test(name, fn) {
+      try { fn(); results.push({ name, ok: true }); }
+      catch (err) { results.push({ name, ok: false, message: err.message }); }
+    }
+    function eq(actual, expected, label) {
+      if (actual !== expected) throw new Error(`${label || 'value'}: expected ${expected}, got ${actual}`);
+    }
+    const rules = (p) => CS.runChecks(p).map((i) => i.rule);
+    const hasRule = (p, rule) => rules(p).includes(rule);
+    function bare(target) { return CS.createProject('T', target || 'sky130', 'blank'); }
+    function pair(p, typeA, typeB, overrides) {
+      const a = CS.createBlock(p, typeA);
+      const b = CS.createBlock(p, typeB);
+      const l = CS.createLink(p, a.id, b.id, overrides);
+      return { a, b, l };
+    }
+
+    test('LED template has no must-fix problems and fits Tiny Tapeout', () => {
+      const p = CS.createProject('T', 'tt', 'tiny');
+      eq(CS.runChecks(p).filter((i) => i.severity === 'fix').length, 0, 'must-fix');
+      eq(CS.usage(p).areaShare < 1, true, 'fits');
+    });
+    test('microcontroller template has no must-fix or warnings', () => {
+      const issues = CS.runChecks(CS.createProject('T', 'sky130', 'micro'));
+      eq(issues.filter((i) => i.severity !== 'tip').map((i) => i.rule).join(), '', 'non-tips');
+    });
+    test('microcontroller does not fit on Tiny Tapeout', () => {
+      eq(hasRule(CS.createProject('T', 'tt', 'micro'), 'over-area'), true);
+    });
+    test('practice template triggers every planted mistake', () => {
+      const found = rules(CS.createProject('T', 'sky130', 'practice'));
+      ['orphan', 'cdc-unhandled', 'cdc-multibit', 'addr-overlap', 'width-mismatch',
+        'over-freq', 'bus-overload', 'reset-domains', 'feature-no-block'].forEach((r) => {
+        eq(found.includes(r), true, r);
+      });
+    });
+    test('blank project reports only that it is empty', () => {
+      eq(rules(bare()).join(), 'empty');
+    });
+
+    test('unconnected block is flagged, support block is not', () => {
+      const p = bare();
+      CS.createBlock(p, 'uart');
+      CS.createBlock(p, 'reset');
+      eq(rules(p).filter((r) => r === 'orphan').length, 1);
+    });
+    test('bus with no manager is flagged', () => {
+      const p = bare();
+      pair(p, 'bus', 'memory');
+      eq(hasRule(p, 'bus-no-manager'), true);
+    });
+    test('bus with only a manager has nothing to talk to', () => {
+      const p = bare();
+      pair(p, 'cpu', 'bus');
+      eq(hasRule(p, 'bus-no-sub'), true);
+    });
+    test('two managers directly wired are flagged, except for debug', () => {
+      const p = bare();
+      pair(p, 'cpu', 'cpu');
+      eq(hasRule(p, 'manager-pair'), true);
+      const q = bare();
+      pair(q, 'debug', 'cpu');
+      eq(hasRule(q, 'manager-pair'), false);
+    });
+    test('two subordinates directly wired are flagged', () => {
+      const p = bare();
+      pair(p, 'uart', 'gpio');
+      eq(hasRule(p, 'sub-pair'), true);
+    });
+
+    test('combinational loop is found, and a flip-flop breaks it', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const c = CS.createBlock(p, 'custom');
+      CS.createLink(p, a.id, b.id, { comb: true });
+      CS.createLink(p, b.id, c.id, { comb: true });
+      const back = CS.createLink(p, c.id, a.id, { comb: true });
+      eq(hasRule(p, 'comb-loop'), true, 'loop');
+      back.comb = false;
+      eq(hasRule(p, 'comb-loop'), false, 'broken');
+    });
+    test('combinational chain without a cycle is fine', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const c = CS.createBlock(p, 'custom');
+      CS.createLink(p, a.id, b.id, { comb: true });
+      CS.createLink(p, a.id, c.id, { comb: true });
+      CS.createLink(p, b.id, c.id, { comb: true });
+      eq(hasRule(p, 'comb-loop'), false);
+    });
+
+    test('crossing fix picks two flip-flops for one wire and a FIFO for many', () => {
+      const p = bare();
+      p.clocks.push({ id: 'c2', name: 'clk2', mhz: 10 });
+      const one = pair(p, 'custom', 'custom', { width: 1 });
+      one.b.clock = 'c2';
+      const many = pair(p, 'custom', 'custom', { width: 8 });
+      many.b.clock = 'c2';
+      const issues = CS.runChecks(p).filter((i) => i.rule === 'cdc-unhandled');
+      eq(issues.find((i) => i.target.id === one.l.id).fix.crossing, '2ff');
+      eq(issues.find((i) => i.target.id === many.l.id).fix.crossing, 'fifo');
+    });
+    test('multi-bit two flip-flop crossing is flagged, one bit is not', () => {
+      const p = bare();
+      p.clocks.push({ id: 'c2', name: 'clk2', mhz: 10 });
+      const x = pair(p, 'custom', 'custom', { width: 8, crossing: '2ff' });
+      x.b.clock = 'c2';
+      eq(hasRule(p, 'cdc-multibit'), true);
+      x.l.width = 1;
+      eq(hasRule(p, 'cdc-multibit'), false);
+    });
+    test('crossing logic on a shared clock is a tip', () => {
+      const p = bare();
+      pair(p, 'custom', 'custom', { crossing: 'fifo' });
+      eq(hasRule(p, 'cdc-unneeded'), true);
+    });
+    test('two used clocks with no reset controller is flagged', () => {
+      const p = bare();
+      p.clocks.push({ id: 'c2', name: 'clk2', mhz: 10 });
+      const x = pair(p, 'custom', 'custom', { crossing: 'fifo' });
+      x.b.clock = 'c2';
+      eq(hasRule(p, 'reset-domains'), true);
+      CS.createBlock(p, 'reset');
+      eq(hasRule(p, 'reset-domains'), false);
+    });
+    test('clock above the target limit is flagged', () => {
+      const p = bare();
+      CS.createBlock(p, 'custom');
+      p.clocks[0].mhz = 500;
+      eq(hasRule(p, 'over-freq'), true);
+    });
+
+    function busWith(p, ...types) {
+      const bus = CS.createBlock(p, 'bus');
+      return { bus, blocks: types.map((t) => {
+        const b = CS.createBlock(p, t);
+        CS.createLink(p, bus.id, b.id);
+        return b;
+      }) };
+    }
+    test('overlapping addresses are detected at the boundary', () => {
+      const p = bare();
+      const { blocks: [mem, uart] } = busWith(p, 'memory', 'uart');
+      mem.baseAddr = 0; mem.memKB = 4;
+      uart.baseAddr = 4095;
+      eq(hasRule(p, 'addr-overlap'), true, 'overlap');
+      uart.baseAddr = 4096;
+      eq(hasRule(p, 'addr-overlap'), false, 'adjacent');
+    });
+    test('unaligned address is flagged', () => {
+      const p = bare();
+      const { blocks: [uart] } = busWith(p, 'uart');
+      uart.baseAddr = 0x100;
+      eq(hasRule(p, 'addr-align'), true);
+    });
+    test('direct-wired block needs no address', () => {
+      const p = bare();
+      pair(p, 'custom', 'gpio');
+      eq(hasRule(p, 'no-address'), false);
+    });
+    test('address assignment clears address problems, even for large memories', () => {
+      const p = bare();
+      const { blocks } = busWith(p, 'cpu', 'memory', 'memory', 'uart', 'gpio');
+      blocks[1].memKB = 3; // Not a power of two.
+      blocks[2].memKB = 64;
+      CS.assignAddresses(p);
+      const found = rules(p);
+      ['no-address', 'addr-overlap', 'addr-align'].forEach((r) => eq(found.includes(r), false, r));
+      eq(blocks[3].baseAddr >= 0x10000000, true, 'peripherals above memory');
+    });
+    test('hex parsing accepts underscores and rejects nonsense', () => {
+      eq(CS.parseHex('0x1000_0000'), 0x10000000);
+      eq(CS.parseHex(''), null);
+      eq(Number.isNaN(CS.parseHex('banana')), true);
+      eq(CS.formatHex(0x10000000), '0x1000_0000');
+    });
+
+    test('width and protocol mismatches on a bus are flagged and fixable', () => {
+      const p = bare();
+      const bus = CS.createBlock(p, 'bus');
+      const u = CS.createBlock(p, 'uart');
+      CS.createLink(p, bus.id, u.id, { width: 8, protocol: 'apb' });
+      const issues = CS.runChecks(p);
+      const width = issues.find((i) => i.rule === 'width-mismatch');
+      const proto = issues.find((i) => i.rule === 'protocol-mismatch');
+      CS.applyFix(p, width.fix);
+      CS.applyFix(p, proto.fix);
+      eq(hasRule(p, 'width-mismatch'), false, 'width fixed');
+      eq(hasRule(p, 'protocol-mismatch'), false, 'protocol fixed');
+    });
+    test('new link to a bus inherits its width and protocol', () => {
+      const p = bare();
+      const bus = CS.createBlock(p, 'bus', 0, 0, { width: 64, protocol: 'axi' });
+      const u = CS.createBlock(p, 'uart');
+      const l = CS.createLink(p, u.id, bus.id);
+      eq(l.width, 64); eq(l.protocol, 'axi');
+    });
+    test('bus bandwidth: exactly full is busy, not overloaded', () => {
+      const p = bare();
+      p.clocks[0].mhz = 50;
+      const { blocks: [accel] } = busWith(p, 'accel');
+      accel.mbps = 200; // 32 bits at 50 MHz carries 200 MB/s.
+      eq(hasRule(p, 'bus-overload'), false, 'full');
+      eq(hasRule(p, 'bus-busy'), true, 'busy');
+      accel.mbps = 201;
+      eq(hasRule(p, 'bus-overload'), true, 'over');
+    });
+    test('area budget warns near the limit and fails past it', () => {
+      const p = bare('tt');
+      const b = CS.createBlock(p, 'custom', 0, 0, { gates: 900 });
+      CS.createLink(p, b.id, CS.createBlock(p, 'custom', 0, 0, { gates: 0 }).id);
+      eq(hasRule(p, 'near-area'), true, 'near');
+      b.gates = 1100;
+      eq(hasRule(p, 'over-area'), true, 'over');
+    });
+    test('pin budget is enforced', () => {
+      const p = bare('tt');
+      const gpio = CS.createBlock(p, 'gpio');
+      gpio.ports.find((x) => x.external).width = 30;
+      eq(hasRule(p, 'over-pins'), true);
+    });
+    test('power domain crossing needs protection', () => {
+      const p = bare();
+      const x = pair(p, 'custom', 'custom');
+      x.b.power = 'sleepy';
+      eq(hasRule(p, 'power-crossing'), true);
+      x.l.isolated = true;
+      eq(hasRule(p, 'power-crossing'), false);
+    });
+
+    test('feature checks: unassigned, untested and idle blocks', () => {
+      const p = bare();
+      pair(p, 'custom', 'gpio');
+      eq(hasRule(p, 'no-features'), true, 'none');
+      const f = CS.createFeature(p, 'Do a thing');
+      const found = rules(p);
+      eq(found.includes('feature-no-block'), true, 'no block');
+      eq(found.includes('feature-no-test'), true, 'no test');
+      eq(found.includes('block-no-feature'), true, 'idle');
+      f.must = false;
+      eq(hasRule(p, 'feature-no-test'), false, 'nice-to-have needs no test');
+    });
+    test('suggestions are offered once and can be skipped', () => {
+      const p = bare();
+      const u = CS.createBlock(p, 'uart');
+      const first = CS.nextSuggestion(p);
+      eq(first.blockId, u.id);
+      CS.createFeature(p, first.title, first.blockId, { sourceKey: first.key });
+      const second = CS.nextSuggestion(p);
+      eq(second.key !== first.key, true, 'moved on');
+      p.skippedSuggestions.push(second.key);
+      eq(CS.nextSuggestion(p), null, 'exhausted');
+    });
+    test('ignored issue is hidden', () => {
+      const p = bare();
+      CS.createBlock(p, 'uart');
+      const issue = CS.runChecks(p).find((i) => i.rule === 'orphan');
+      p.ignored.push(issue.key);
+      eq(hasRule(p, 'orphan'), false);
+    });
+    test('must-fix problems sort first', () => {
+      const issues = CS.runChecks(CS.createProject('T', 'sky130', 'practice'));
+      eq(issues[0].severity, 'fix');
+      const order = issues.map((i) => ({ fix: 0, warn: 1, tip: 2 }[i.severity]));
+      eq(order.every((v, i) => i === 0 || order[i - 1] <= v), true, 'sorted');
+    });
+    test('no one-click fix creates a new must-fix problem', () => {
+      Object.keys(CS.TEMPLATES).forEach((key) => {
+        let p = CS.createProject('T', 'sky130', key);
+        // Apply one fix at a time, in a fresh copy, and compare must-fix counts.
+        CS.runChecks(p).filter((i) => i.fix).forEach((issue) => {
+          const copy = CS.normalize(JSON.parse(JSON.stringify(p)));
+          const before = CS.runChecks(copy).filter((i) => i.severity === 'fix').length;
+          CS.applyFix(copy, issue.fix);
+          const after = CS.runChecks(copy).filter((i) => i.severity === 'fix').length;
+          eq(after <= before, true, `${key}/${issue.rule} went ${before} to ${after}`);
+        });
+      });
+    });
+    test('a must-fix problem means not ready', () => {
+      eq(CS.isReadyForRtl([{ severity: 'fix' }]), false);
+    });
+
+    test('removing a block removes its links and unassigns its features', () => {
+      const p = bare();
+      const { a, b } = pair(p, 'custom', 'custom');
+      const f = CS.createFeature(p, 'x', a.id);
+      CS.removeBlock(p, a.id);
+      eq(p.links.length, 0); eq(f.blockId, null); eq(p.blocks[0].id, b.id);
+    });
+    test('loading rejects junk and repairs bad fields', () => {
+      let threw = false;
+      try { CS.normalize('nope'); } catch (e) { threw = true; }
+      eq(threw, true, 'junk');
+      const p = CS.normalize({
+        target: 'constructor',
+        name: 42,
+        blocks: [
+          { id: 'x', type: 'constructor', gates: 'many', clock: 'gone' },
+          { id: 'x', type: 'bus', protocol: '__proto__' },
+          null,
+        ],
+        links: [{ from: 'x', to: 'missing' }, { from: 'x', to: 'x' }],
+        features: [{ title: '<img src=x>', status: 'whatever', blockId: 'gone' }],
+      });
+      eq(p.target, 'tt', 'target');
+      eq(p.name, 'My chip', 'name');
+      eq(p.blocks[0].type, 'custom', 'type');
+      eq(p.blocks[0].gates, 1000, 'gates');
+      eq(p.blocks[0].clock, null, 'clock');
+      eq(p.blocks[1].id !== 'x', true, 'unique id');
+      eq(p.blocks[1].protocol, 'axi-lite', 'protocol');
+      eq(p.links.length, 0, 'links');
+      eq(p.features[0].status, 'todo', 'status');
+      eq(p.features[0].blockId, null, 'feature block');
+      CS.runChecks(p);
+    });
+    test('a saved project reloads unchanged', () => {
+      const p = CS.createProject('Round trip', 'sky130', 'practice');
+      const again = CS.normalize(JSON.parse(JSON.stringify(p)));
+      eq(JSON.stringify(again), JSON.stringify(CS.normalize(JSON.parse(JSON.stringify(again)))), 'stable');
+      eq(CS.runChecks(again).length, CS.runChecks(p).length, 'same issues');
+    });
+    test('SDC export states periods and clock groups', () => {
+      const p = CS.createProject('T', 'sky130', 'practice');
+      const sdc = CS.toSdc(p);
+      eq(sdc.includes('create_clock -name clk_main -period 20.000 [get_ports clk_main]'), true, 'period');
+      eq(sdc.includes('set_clock_groups -asynchronous -group {clk_main} -group {clk_fast}'), true, 'groups');
+      p.clocks[0].name = '1 bad name';
+      eq(CS.toSdc(p).includes('clk_1_bad_name'), true, 'safe name');
+    });
+    test('written spec includes features and open problems', () => {
+      const p = CS.createProject('T', 'sky130', 'practice');
+      const md = CS.toMarkdown(p, CS.runChecks(p));
+      eq(md.includes('- [ ] Detect edges in a camera image'), true, 'feature');
+      eq(md.includes('Must fix:'), true, 'problems');
+      eq(md.includes('[['), false, 'no glossary markup');
+    });
+
+    /* ---------- Ports and nets ---------- */
+
+    const portNamed = (block, name) => block.ports.find((x) => x.name === name);
+
+    test('each block type starts with its ports, and pins come from them', () => {
+      const p = bare();
+      eq(CS.createBlock(p, 'uart').ports.map((x) => x.name).join(), 's_bus,tx,rx');
+      eq(CS.usage(p).pins, 2, 'uart pins');
+      CS.createBlock(p, 'gpio');
+      eq(CS.usage(p).pins, 10, 'uart and gpio pins');
+    });
+    test('connecting picks ports with the same name', () => {
+      const p = bare();
+      const cpu = CS.createBlock(p, 'cpu');
+      const dbg = CS.createBlock(p, 'debug');
+      const timer = CS.createBlock(p, 'timer');
+      const a = CS.createLink(p, dbg.id, cpu.id);
+      const b = CS.createLink(p, timer.id, cpu.id);
+      eq(a.fromPort, portNamed(dbg, 'dbg').id, 'debug out');
+      eq(a.toPort, portNamed(cpu, 'dbg').id, 'cpu dbg');
+      eq(b.toPort, portNamed(cpu, 'irq').id, 'cpu irq');
+      eq(a.width, 4, 'width from port');
+      eq(b.net, 'timer_irq', 'default net name');
+    });
+    test('connecting to a bus adds named taps and uses bus interfaces', () => {
+      const p = bare();
+      const bus = CS.createBlock(p, 'bus');
+      const cpu = CS.createBlock(p, 'cpu');
+      const mem = CS.createBlock(p, 'memory');
+      const a = CS.createLink(p, cpu.id, bus.id);
+      const b = CS.createLink(p, bus.id, mem.id);
+      eq(bus.ports.map((x) => x.name).join(), 'm0,s0');
+      eq(a.fromPort, portNamed(cpu, 'm_bus').id, 'cpu uses m_bus');
+      eq(b.toPort, portNamed(mem, 's_bus').id, 'memory uses s_bus');
+      eq(b.net, 'memory_bus', 'net name');
+    });
+    test('removing a connection removes its bus tap but keeps other ports', () => {
+      const p = bare();
+      const bus = CS.createBlock(p, 'bus');
+      const mem = CS.createBlock(p, 'memory');
+      const l = CS.createLink(p, bus.id, mem.id);
+      CS.removeLink(p, l.id);
+      eq(bus.ports.length, 0, 'tap');
+      eq(mem.ports.length, 1, 'memory port');
+    });
+    test('removing a port removes its nets', () => {
+      const p = bare();
+      const { a, l } = pair(p, 'custom', 'custom');
+      CS.removePort(p, a, l.fromPort);
+      eq(p.links.length, 0, 'links');
+      eq(a.ports.length, 1, 'ports');
+    });
+    test('the driver always comes first, however the wire was dragged', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const l = CS.createLink(p, a.id, b.id, { fromPort: portNamed(a, 'in').id, toPort: portNamed(b, 'out').id });
+      eq(l.from, b.id, 'from');
+      eq(l.fromPort, portNamed(b, 'out').id, 'from port');
+    });
+    test('a second connection from one output shares its net', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const c = CS.createBlock(p, 'custom');
+      const out = portNamed(a, 'out').id;
+      const one = CS.createLink(p, a.id, b.id, { fromPort: out });
+      const two = CS.createLink(p, a.id, c.id, { fromPort: out });
+      eq(two.net, one.net, 'same net');
+      eq(hasRule(p, 'net-multi-driver'), false, 'one driver');
+    });
+    test('two outputs on one net are flagged', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      CS.createLink(p, a.id, b.id, { fromPort: portNamed(a, 'out').id, toPort: portNamed(b, 'out').id });
+      eq(hasRule(p, 'net-multi-driver'), true);
+    });
+    test('joining nets by name can create a conflict', () => {
+      const p = bare();
+      const x = pair(p, 'custom', 'custom');
+      const y = pair(p, 'custom', 'custom', { width: 4 });
+      eq(hasRule(p, 'net-multi-driver'), false, 'separate');
+      y.l.net = x.l.net;
+      eq(hasRule(p, 'net-multi-driver'), true, 'joined drivers');
+      eq(hasRule(p, 'net-width-conflict'), true, 'joined widths');
+    });
+    test('a net with only inputs has no driver', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      CS.createLink(p, a.id, b.id, { fromPort: portNamed(a, 'in').id, toPort: portNamed(b, 'in').id });
+      eq(hasRule(p, 'net-no-driver'), true);
+    });
+    test('a chosen port with the wrong width is flagged and fixable', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      portNamed(b, 'in').width = 16;
+      CS.createLink(p, a.id, b.id, { fromPort: portNamed(a, 'out').id, toPort: portNamed(b, 'in').id });
+      const issue = CS.runChecks(p).find((i) => i.rule === 'port-width');
+      eq(!!issue, true, 'flagged');
+      CS.applyFix(p, issue.fix);
+      eq(hasRule(p, 'port-width'), false, 'fixed');
+    });
+    test('illegal names are flagged and the fix makes them legal', () => {
+      const p = bare();
+      const x = pair(p, 'custom', 'custom');
+      x.l.net = 'my net';
+      portNamed(x.a, 'in').name = 'wire';
+      const issues = CS.runChecks(p);
+      const net = issues.find((i) => i.rule === 'bad-net-name');
+      const port = issues.find((i) => i.rule === 'bad-port-name');
+      CS.applyFix(p, net.fix);
+      CS.applyFix(p, port.fix);
+      eq(x.l.net, 'my_net', 'net');
+      eq(CS.isLegalName(portNamed(x.a, 'wire_i').name), true, 'port');
+      eq(hasRule(p, 'bad-net-name') || hasRule(p, 'bad-port-name'), false, 'clean');
+    });
+    test('duplicate port names are flagged and fixable', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      a.ports[1].name = a.ports[0].name;
+      const issue = CS.runChecks(p).find((i) => i.rule === 'dup-port');
+      eq(issue.severity, 'fix', 'severity');
+      CS.applyFix(p, issue.fix);
+      eq(hasRule(p, 'dup-port'), false, 'fixed');
+    });
+    test('renaming a net renames every connection on it', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const c = CS.createBlock(p, 'custom');
+      const out = portNamed(a, 'out').id;
+      const one = CS.createLink(p, a.id, b.id, { fromPort: out });
+      const two = CS.createLink(p, a.id, c.id, { fromPort: out });
+      CS.renameNet(p, one.net, 'video');
+      eq(one.net + two.net, 'videovideo');
+    });
+    test('unconnected inputs are one tip, and chip pins do not count', () => {
+      const p = bare();
+      const uart = CS.createBlock(p, 'uart');
+      const cpu = CS.createBlock(p, 'cpu');
+      CS.createLink(p, cpu.id, uart.id);
+      const tip = CS.runChecks(p).find((i) => i.rule === 'port-unconnected');
+      eq(tip.severity, 'tip', 'severity');
+      eq(tip.plainTitle.includes('Processor.irq'), true, 'names the port');
+      eq(tip.plainTitle.includes('rx'), false, 'skips chip pins');
+    });
+    test('default names in the clean templates are legal RTL names', () => {
+      ['tiny', 'micro'].forEach((key) => {
+        const p = CS.createProject('T', 'sky130', key);
+        p.links.forEach((l) => eq(CS.isLegalName(l.net), true, l.net));
+        p.blocks.forEach((b) => b.ports.forEach((x) => eq(CS.isLegalName(x.name), true, x.name)));
+      });
+    });
+    test('name helper produces legal names from anything', () => {
+      ['Main bus', '9lives', 'wire', '***', ' a-b '].forEach((text) => {
+        eq(CS.isLegalName(CS.identifier(text)), true, text);
+      });
+      eq(CS.identifier('Main bus'), 'main_bus');
+    });
+    test('old project files keep their pins and gain ports and nets', () => {
+      const p = CS.normalize({
+        version: 1,
+        name: 'Old',
+        clocks: [{ id: 'c1', name: 'clk', mhz: 25 }],
+        blocks: [
+          { id: 'a', type: 'custom', name: 'Sensor', x: 0, y: 0, clock: 'c1', pins: 5 },
+          { id: 'b', type: 'uart', name: 'UART', x: 0, y: 0, clock: 'c1', pins: 0 },
+          { id: 'c', type: 'gpio', name: 'GPIO', x: 0, y: 0, clock: 'c1', pins: 8 },
+        ],
+        links: [{ id: 'l1', from: 'a', to: 'b', protocol: 'wires', width: 8 }],
+      });
+      eq(CS.usage(p).pins, 13, 'pins');
+      eq(!!p.links[0].fromPort && !!p.links[0].toPort, true, 'ports');
+      eq(CS.isLegalName(p.links[0].net), true, 'net');
+      eq(p.links[0].width, 8, 'width kept');
+      eq(p.version, 2, 'version');
+      const boxes = [...CS.layout.compute(p).blocks.values()];
+      eq(boxes.some((x) => x.x !== boxes[0].x || x.y !== boxes[0].y), true, 'blocks spread out');
+    });
+    test('spec lists ports and nets', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const md = CS.toMarkdown(p, []);
+      eq(md.includes('## Ports'), true, 'ports');
+      eq(md.includes('| timer_irq | Timer.irq | Processor.irq |'), true, 'net row');
+    });
+
+    /* ---------- Layout ---------- */
+
+    const hitsBox = (a, b, box) => (
+      Math.max(a.x, b.x) > box.x && Math.min(a.x, b.x) < box.x + box.w
+      && Math.max(a.y, b.y) > box.y && Math.min(a.y, b.y) < box.y + box.h
+    );
+    function eachTemplate(fn) {
+      Object.keys(CS.TEMPLATES).filter((k) => k !== 'blank').forEach((key) => {
+        fn(CS.createProject('T', 'sky130', key), key);
+      });
+    }
+
+    test('tidy leaves no blocks overlapping', () => {
+      eachTemplate((p, key) => {
+        const boxes = [...CS.layout.compute(p).blocks.values()];
+        boxes.forEach((a, i) => boxes.slice(i + 1).forEach((b) => {
+          const apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+          eq(apart, true, `${key} overlap`);
+        }));
+      });
+    });
+    test('wires run only horizontally and vertically, from port to port', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        eq(geo.routes.length, p.links.length, `${key} routes`);
+        geo.routes.forEach((r) => {
+          const link = p.links.find((l) => l.id === r.linkId);
+          const start = geo.points.get(link.fromPort);
+          const end = geo.points.get(link.toPort);
+          eq(r.path[0].x === start.x && r.path[0].y === start.y, true, `${key} starts at port`);
+          const last = r.path[r.path.length - 1];
+          eq(last.x === end.x && last.y === end.y, true, `${key} ends at port`);
+          for (let i = 0; i < r.path.length - 1; i += 1) {
+            eq(r.path[i].x === r.path[i + 1].x || r.path[i].y === r.path[i + 1].y, true, `${key} ${r.net} straight`);
+          }
+        });
+      });
+    });
+    test('wires do not pass through blocks', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        const check = (path, own, label) => {
+          geo.blocks.forEach((box, id) => {
+            for (let i = 0; i < path.length - 1; i += 1) {
+              eq(hitsBox(path[i], path[i + 1], box), false, `${key}: ${label} crosses ${id}`);
+            }
+          });
+        };
+        geo.routes.forEach((r) => check(r.path, [], r.net));
+        geo.pads.forEach((pad) => check(pad.path, [], pad.name));
+      });
+    });
+    test('every chip pin port has a pad on the chip edge', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        const pins = p.blocks.flatMap((b) => b.ports.filter((x) => x.external));
+        eq(geo.pads.length, pins.length, `${key} pads`);
+        geo.pads.forEach((pad) => {
+          eq(pad.x === geo.die.x || pad.x === geo.die.x + geo.die.w, true, `${key} on edge`);
+          eq(pad.y >= geo.die.y && pad.y <= geo.die.y + geo.die.h, true, `${key} within edge`);
+        });
+      });
+    });
+    test('the chip outline contains every block', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        geo.blocks.forEach((b) => {
+          eq(b.x >= geo.die.x && b.y >= geo.die.y && b.x + b.w <= geo.die.x + geo.die.w && b.y + b.h <= geo.die.y + geo.die.h, true, key);
+        });
+      });
+    });
+    test('net labels do not overlap each other or blocks', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+        geo.labels.forEach((a, i) => {
+          geo.labels.slice(i + 1).forEach((b) => eq(overlap(a, b), false, `${key} labels`));
+          geo.blocks.forEach((box) => eq(overlap(a, box), false, `${key} label on block`));
+        });
+      });
+    });
+    test('net names touch no wire at all', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        const wires = geo.routes.map((r) => r.path).concat(geo.pads.map((pad) => pad.path));
+        geo.labels.forEach((box) => wires.forEach((wire) => {
+          for (let i = 0; i < wire.length - 1; i += 1) {
+            eq(hitsBox(wire[i], wire[i + 1], box), false, `${key}: label at ${Math.round(box.x)},${Math.round(box.y)}`);
+          }
+        }));
+      });
+    });
+    test('net names stay clear of wires after a block is moved', () => {
+      eachTemplate((p, key) => {
+        p.blocks.forEach((b, i) => { b.x += (i % 3) * 40; b.y += (i % 2) * 60; });
+        const geo = CS.layout.compute(p);
+        const wires = geo.routes.map((r) => r.path).concat(geo.pads.map((pad) => pad.path));
+        geo.labels.forEach((box) => wires.forEach((wire) => {
+          for (let i = 0; i < wire.length - 1; i += 1) eq(hitsBox(wire[i], wire[i + 1], box), false, key);
+        }));
+      });
+    });
+    test('a port placed by hand stays on that side and row', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const uart = p.blocks.find((b) => b.name === 'UART');
+      const tx = uart.ports.find((x) => x.name === 'tx');
+      const rx = uart.ports.find((x) => x.name === 'rx');
+      tx.side = 'left'; tx.rank = 0;
+      rx.side = 'left'; rx.rank = 1;
+      const rows = CS.layout.compute(p).blocks.get(uart.id).rows.filter((r) => r.side === 'left');
+      eq(rows[0].port.name, 'tx', 'first row');
+      eq(rows[1].port.name, 'rx', 'second row');
+    });
+    test('hand placement survives saving', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const uart = p.blocks.find((b) => b.name === 'UART');
+      uart.ports[0].side = 'right';
+      uart.ports[0].rank = 2;
+      p.links[0].bend = 40;
+      const again = CS.normalize(JSON.parse(JSON.stringify(p)));
+      eq(again.blocks.find((b) => b.name === 'UART').ports[0].side, 'right', 'side');
+      eq(again.blocks.find((b) => b.name === 'UART').ports[0].rank, 2, 'rank');
+      eq(again.links[0].bend, 40, 'bend');
+    });
+    test('a wire with a bend moves its channel, and still avoids blocks', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const link = p.links.find((l) => l.net === 'memory_bus');
+      const verticalX = () => {
+        const { path } = CS.layout.compute(p).routes.find((r) => r.linkId === link.id);
+        return path.find((pt, i) => i < path.length - 1 && pt.x === path[i + 1].x).x;
+      };
+      const before = verticalX();
+      link.bend = -30;
+      eq(verticalX() < before, true, 'moved left');
+      [-2000, 2000].forEach((bend) => {
+        link.bend = bend;
+        const geo = CS.layout.compute(p);
+        const { path } = geo.routes.find((r) => r.linkId === link.id);
+        geo.blocks.forEach((box) => {
+          for (let i = 0; i < path.length - 1; i += 1) eq(hitsBox(path[i], path[i + 1], box), false, `bend ${bend}`);
+        });
+      });
+    });
+    test('Tidy up forgets everything placed by hand', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      p.blocks[0].ports[0].side = 'left';
+      p.blocks[0].ports[0].rank = 1;
+      p.links[0].bend = 50;
+      CS.layout.tidy(p);
+      eq(p.blocks[0].ports[0].side, undefined, 'side');
+      eq(p.blocks[0].ports[0].rank, undefined, 'rank');
+      eq(p.links[0].bend, undefined, 'bend');
+    });
+    test('ports hold still while a block is dragged past its neighbour', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const cpu = p.blocks.find((b) => b.name === 'Processor');
+      const bus = p.blocks.find((b) => b.name === 'Main bus');
+      const rowsBefore = JSON.stringify(CS.layout.compute(p).blocks.get(cpu.id).rows.map((r) => [r.port.name, r.side]));
+      const held = CS.layout.freeze(p);
+      cpu.x = bus.x + 900; // The bus is now on the other side of the processor.
+      const frozen = JSON.stringify(CS.layout.compute(p, held).blocks.get(cpu.id).rows.map((r) => [r.port.name, r.side]));
+      eq(frozen, rowsBefore, 'unchanged while dragging');
+      const released = JSON.stringify(CS.layout.compute(p).blocks.get(cpu.id).rows.map((r) => [r.port.name, r.side]));
+      eq(released === rowsBefore, false, 'settles after release');
+    });
+    test('the microcontroller template labels every net', () => {
+      const geo = CS.layout.compute(CS.createProject('T', 'sky130', 'micro'));
+      eq(geo.routes.every((r) => !!r.label), true);
+    });
+    test('wires still avoid blocks after a block is moved', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      p.blocks.find((b) => b.name === 'Reset controller').x = 260;
+      const geo = CS.layout.compute(p);
+      geo.routes.forEach((r) => {
+        geo.blocks.forEach((box) => {
+          for (let i = 0; i < r.path.length - 1; i += 1) {
+            eq(hitsBox(r.path[i], r.path[i + 1], box), false, r.net);
+          }
+        });
+      });
+    });
+    test('the bus fan in the microcontroller template has no wire crossings', () => {
+      const geo = CS.layout.compute(CS.createProject('T', 'sky130', 'micro'));
+      const segments = geo.routes.filter((r) => r.net.endsWith('_bus'))
+        .flatMap((r) => r.path.slice(0, -1).map((a, i) => ({ net: r.net, a, b: r.path[i + 1] })));
+      const between = (v, x, y) => v > Math.min(x, y) && v < Math.max(x, y);
+      const crossings = [];
+      segments.forEach((h) => segments.forEach((v) => {
+        if (h.a.y === h.b.y && v.a.x === v.b.x && h.net !== v.net
+          && between(v.a.x, h.a.x, h.b.x) && between(h.a.y, v.a.y, v.b.y)) {
+          crossings.push(`${h.net} x ${v.net}`);
+        }
+      }));
+      eq(crossings.join(), '', 'crossings');
+    });
+    test('peripherals sit after the bus, even with an interrupt to the processor', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      const x = (name) => p.blocks.find((b) => b.name === name).x;
+      eq(x('Processor') < x('Main bus'), true, 'processor first');
+      eq(x('Main bus') < x('Timer'), true, 'timer after bus');
+      eq(x('Timer'), x('Memory'), 'same column as memory');
+    });
+    test('the view leaves room for the longest pin name', () => {
+      eachTemplate((p, key) => {
+        const geo = CS.layout.compute(p);
+        geo.pads.forEach((pad) => {
+          const need = CS.layout.pinLabelText(pad).length * 6.3 + 12;
+          if (pad.side === 'left') eq(pad.x - need >= geo.world.x, true, `${key} ${pad.name}`);
+          else eq(pad.x + need <= geo.world.x + geo.world.w, true, `${key} ${pad.name}`);
+        });
+      });
+    });
+    test('an empty project lays out without error', () => {
+      const geo = CS.layout.compute(bare());
+      eq(geo.die, null);
+    });
+
+    /* ---------- Verilog export ---------- */
+
+    // A small structural reader. It is not a Verilog compiler, but it catches names
+    // that do not resolve, which is the likeliest way for this generator to go wrong.
+    function readVerilog(text) {
+      const code = text.replace(/\/\/[^\n]*/g, '');
+      const modules = new Map();
+      const pattern = /\bmodule\s+(\S+)\s*\(([\s\S]*?)\);([\s\S]*?)\bendmodule\b/g;
+      let match = pattern.exec(code);
+      while (match) {
+        const ports = new Map();
+        match[2].split(',').map((x) => x.trim()).filter(Boolean).forEach((line) => {
+          const m = /^(input|output|inout)\s+wire\s+(?:\[(\d+):0\]\s+)?(\S+)$/.exec(line);
+          if (!m) throw new Error(`bad port line: ${line}`);
+          ports.set(m[3], { dir: m[1], width: m[2] ? Number(m[2]) + 1 : 1 });
+        });
+        modules.set(match[1], { ports, body: match[3] });
+        match = pattern.exec(code);
+      }
+      eq((code.match(/\bmodule\b/g) || []).length, modules.size, 'every module parsed');
+      eq((code.match(/\bendmodule\b/g) || []).length, modules.size, 'every module closed');
+      return modules;
+    }
+    function instancesIn(body) {
+      const found = [];
+      const pattern = /^\s*(\S+)\s+(u_\S+)\s*\(([\s\S]*?)\);/gm;
+      let match = pattern.exec(body);
+      while (match) {
+        const pins = match[3].split(',').map((x) => x.trim()).filter(Boolean).map((x) => {
+          const m = /^\.(\S+?)\((\S*)\)$/.exec(x);
+          if (!m) throw new Error(`bad connection: ${x}`);
+          return { port: m[1], signal: m[2] };
+        });
+        found.push({ module: match[1], name: match[2], pins });
+        match = pattern.exec(body);
+      }
+      return found;
+    }
+    function checkStructure(p, label) {
+      const text = CS.toVerilog(p, []);
+      const modules = readVerilog(text);
+      const top = modules.get([...modules.keys()][0]);
+      eq(modules.size, p.blocks.length + 1, `${label} one module per block`);
+      const wires = new Map();
+      [...top.body.matchAll(/^\s*wire\s+(?:\[(\d+):0\]\s+)?(\S+?);/gm)].forEach((m) => {
+        eq(wires.has(m[2]), false, `${label} wire ${m[2]} declared once`);
+        wires.set(m[2], m[1] ? Number(m[1]) + 1 : 1);
+      });
+      top.ports.forEach((value, name) => {
+        eq(wires.has(name), false, `${label} ${name} is both a port and a wire`);
+        wires.set(name, value.width);
+      });
+      const instances = instancesIn(top.body);
+      eq(instances.length, p.blocks.length, `${label} one instance per block`);
+      eq(new Set(instances.map((x) => x.name)).size, instances.length, `${label} unique instances`);
+      instances.forEach((inst) => {
+        const target = modules.get(inst.module);
+        eq(!!target, true, `${label} module ${inst.module} exists`);
+        eq(inst.pins.length, target.ports.size, `${label} ${inst.module} connects every port`);
+        inst.pins.forEach((pin) => {
+          eq(target.ports.has(pin.port), true, `${label} ${inst.module}.${pin.port} exists`);
+          if (pin.signal) eq(wires.has(pin.signal), true, `${label} signal ${pin.signal} declared`);
+        });
+      });
+      [...modules.keys()].forEach((name) => eq(CS.isLegalName(name), true, `${label} module name ${name}`));
+      [...wires.keys()].forEach((name) => eq(CS.isLegalName(name), true, `${label} wire name ${name}`));
+      eq(text.includes('`default_nettype none'), true, `${label} catches implicit nets`);
+      return { text, modules, top, wires, instances };
+    }
+
+    test('every template exports names that all resolve', () => {
+      Object.keys(CS.TEMPLATES).forEach((key) => checkStructure(CS.createProject('T', 'sky130', key), key));
+    });
+    test('the microcontroller exports its pins, nets and connections', () => {
+      const p = CS.createProject('Small MCU', 'sky130', 'micro');
+      const { top, wires, instances, modules } = checkStructure(p, 'micro');
+      eq(modules.has('small_mcu'), true, 'top name');
+      eq(top.ports.get('clk_main').dir, 'input', 'clock');
+      eq(top.ports.get('uart_tx').dir, 'output', 'tx');
+      eq(top.ports.get('uart_rx').dir, 'input', 'rx');
+      eq(top.ports.get('gpio_io').dir, 'inout', 'gpio dir');
+      eq(top.ports.get('gpio_io').width, 8, 'gpio width');
+      eq(wires.get('memory_bus'), 32, 'bus width');
+      const timer = instances.find((x) => x.name === 'u_timer');
+      eq(timer.pins.find((x) => x.port === 'irq').signal, 'timer_irq', 'irq net');
+      eq(timer.pins.find((x) => x.port === 'clk').signal, 'clk_main', 'clock net');
+    });
+    test('net and port widths agree in a clean template', () => {
+      ['tiny', 'micro'].forEach((key) => {
+        const { modules, wires, instances } = checkStructure(CS.createProject('T', 'sky130', key), key);
+        instances.forEach((inst) => inst.pins.forEach((pin) => {
+          if (pin.signal) eq(modules.get(inst.module).ports.get(pin.port).width, wires.get(pin.signal), `${inst.name}.${pin.port}`);
+        }));
+      });
+    });
+    test('a reset controller drives every block, and takes no reset itself', () => {
+      const { top, instances } = checkStructure(CS.createProject('T', 'sky130', 'micro'), 'micro');
+      eq(top.ports.has('rst_n'), false, 'no extra reset pin');
+      eq(top.ports.has('reset_controller_rst_in'), true, 'its own pin');
+      const controller = instances.find((x) => x.name === 'u_reset_controller');
+      eq(controller.pins.some((x) => x.port === 'rst_n'), false, 'no reset into itself');
+      const signal = controller.pins.find((x) => x.port === 'rst_out').signal;
+      instances.filter((x) => x !== controller).forEach((inst) => {
+        eq(inst.pins.find((x) => x.port === 'rst_n').signal, signal, inst.name);
+      });
+    });
+    test('without a reset controller, reset is a chip input', () => {
+      const { top, instances } = checkStructure(CS.createProject('T', 'tt', 'tiny'), 'tiny');
+      eq(top.ports.get('rst_n').dir, 'input', 'input');
+      eq(instances[0].pins.find((x) => x.port === 'rst_n').signal, 'rst_n', 'connected');
+    });
+    test('fanout shares one wire', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      const c = CS.createBlock(p, 'custom');
+      const out = portNamed(a, 'out').id;
+      const one = CS.createLink(p, a.id, b.id, { fromPort: out });
+      CS.createLink(p, a.id, c.id, { fromPort: out });
+      const { text } = checkStructure(p, 'fanout');
+      eq((text.match(new RegExp(`wire \\[7:0\\] ${one.net};`, 'g')) || []).length, 1, 'declared once');
+    });
+    test('unconnected ports are left open, and outputs in empty blocks are held low', () => {
+      const p = bare();
+      const a = CS.createBlock(p, 'custom', 0, 0, { name: 'Alpha' });
+      const { instances, modules } = checkStructure(p, 'open');
+      eq(instances[0].pins.find((x) => x.port === 'in').signal, '', 'open');
+      eq(modules.get('alpha').body.includes("assign out = {8{1'b0}};"), true, 'tied');
+      const one = CS.toVerilog(CS.createProject('T', 'sky130', 'micro'), []);
+      eq(one.includes("assign irq = 1'b0;"), true, 'single bit is plain');
+      eq(one.includes('{1{'), false, 'no one-bit replication');
+      eq(a.ports.length, 2, 'unchanged');
+    });
+    test('awkward names still produce legal, unique Verilog', () => {
+      const p = CS.createProject('wire', 'sky130', 'blank');
+      p.clocks[0].name = 'reg';
+      const a = CS.createBlock(p, 'custom', 0, 0, { name: 'Main block' });
+      const b = CS.createBlock(p, 'custom', 0, 0, { name: 'main-block' });
+      const c = CS.createBlock(p, 'custom', 0, 0, { name: 'Wire' });
+      a.ports[0].name = 'clk'; // Clashes with the clock port added to every block.
+      a.ports[1].name = 'my port';
+      b.ports[0].name = 'my port';
+      b.ports[1].name = 'my_port';
+      CS.createLink(p, a.id, b.id, { fromPort: a.ports[1].id, toPort: b.ports[0].id, net: 'clk_reg' });
+      CS.createLink(p, b.id, c.id, { fromPort: b.ports[1].id, toPort: c.ports[0].id, net: 'bad net!' });
+      CS.addPort(p, c, 'x', 'out', 1, true);
+      const d = CS.createBlock(p, 'custom', 0, 0, { name: 'Pin' });
+      d.ports = [{ id: 'zz', name: 'x', dir: 'in', width: 1, external: true }];
+      const { top, modules, wires } = checkStructure(p, 'awkward');
+      eq(modules.has('wire'), false, 'keyword module');
+      eq(modules.size, 5, 'all modules kept');
+      eq(modules.has('main_block') && modules.has('main_block_2'), true, 'duplicates separated');
+      eq(wires.has('bad_net'), true, 'net cleaned');
+      eq(top.ports.has('clk_reg'), true, 'clock keeps SDC name');
+      eq(wires.has('clk_reg_2'), true, 'net moved off the clock name');
+    });
+    test('SystemVerilog reserved words are avoided too', () => {
+      const p = bare();
+      ['Interface', 'Program', 'Bit', 'Generate'].forEach((name) => CS.createBlock(p, 'custom', 0, 0, { name }));
+      const { modules } = checkStructure(p, 'reserved');
+      ['interface', 'program', 'bit', 'generate'].forEach((word) => {
+        eq(modules.has(word), false, word);
+        eq(CS.isLegalName(word), false, `${word} is rejected`);
+      });
+    });
+    test('default ports and template names are not reserved words', () => {
+      Object.values(CS.BLOCK_TYPES).forEach((type) => {
+        type.ports.forEach((x) => eq(CS.isLegalName(x.name), true, x.name));
+      });
+    });
+    test('names cannot break out of a comment', () => {
+      const p = CS.createProject('T', 'sky130', 'blank');
+      p.name = 'evil\nmodule injected; endmodule';
+      CS.createBlock(p, 'custom', 0, 0, { name: 'bad\nendmodule' });
+      const text = CS.toVerilog(p, []);
+      const code = text.replace(/\/\/[^\n]*/g, '');
+      eq(code.includes('injected;'), false, 'project name');
+      eq((code.match(/\bendmodule\b/g) || []).length, 2, 'block name');
+    });
+    test('every clock in the SDC export is an input in the Verilog', () => {
+      const p = CS.createProject('T', 'sky130', 'practice');
+      p.clocks[1].name = 'clk fast!';
+      const { top } = checkStructure(p, 'practice');
+      const sdc = CS.toSdc(p);
+      [...sdc.matchAll(/get_ports (\S+?)\]/g)].forEach((m) => {
+        eq(top.ports.has(m[1]) && top.ports.get(m[1]).dir === 'input', true, m[1]);
+      });
+    });
+    test('bus interfaces, clock crossings and open problems are noted', () => {
+      const p = CS.createProject('T', 'sky130', 'practice');
+      const text = CS.toVerilog(p, CS.runChecks(p));
+      eq(text.includes('// bus interface placeholder'), true, 'placeholder');
+      eq(text.includes('clock crossing not handled'), true, 'crossing');
+      eq(/WARNING: the sketch still had \d+ must-fix problems/.test(text), true, 'problems');
+      eq(CS.toVerilog(CS.createProject('T', 'sky130', 'micro'), []).includes('WARNING'), false, 'clean has no warning');
+    });
+    test('an empty chip exports a valid empty top module', () => {
+      const p = bare();
+      const { modules } = checkStructure(p, 'empty');
+      eq(modules.size, 1, 'just the top');
+    });
+
+    /* ---------- Fixes from security audit run 1 ---------- */
+
+    const hidingFile = () => ({
+      version: 2,
+      target: 'sky130',
+      clocks: [{ id: 'c1', name: 'clk', mhz: 25 }],
+      blocks: [{ id: 'u', type: 'uart' }],
+      ignored: ['orphan:u', 'no-clock:u'],
+    });
+
+    test('an opened file cannot hide its own must-fix problems', () => {
+      const { project, hiddenByFile } = CS.openProject(hidingFile());
+      eq(hiddenByFile, 2, 'reports what it cleared');
+      eq(project.ignored.length, 0, 'cleared');
+      const issues = CS.runChecks(project);
+      eq(issues.some((i) => i.key === 'orphan:u' && i.severity === 'fix'), true, 'orphan is back');
+      eq(issues.some((i) => i.key === 'no-clock:u' && i.severity === 'fix'), true, 'clock is back');
+      eq(CS.isReadyForRtl(issues), false, 'not ready');
+      eq(CS.toMarkdown(project, issues, CS.hiddenIssues(project)).includes('Must fix:'), true, 'spec');
+      eq(CS.toVerilog(project, CS.allIssues(project)).includes('WARNING'), true, 'verilog');
+    });
+    test('your own dismissals survive autosave and undo, which use normalize', () => {
+      const p = CS.normalize(hidingFile());
+      eq(p.ignored.length, 2, 'kept');
+      eq(CS.runChecks(p).some((i) => i.key === 'orphan:u'), false, 'still hidden on screen');
+    });
+    test('exports always disclose hidden problems', () => {
+      const p = CS.normalize(hidingFile());
+      const issues = CS.runChecks(p);
+      const hidden = CS.hiddenIssues(p);
+      eq(hidden.length, 2, 'found');
+      const md = CS.toMarkdown(p, issues, hidden);
+      eq(md.includes('## Hidden problems'), true, 'spec section');
+      eq(/Must fix: UART is not connected/.test(md), true, 'spec names it');
+      const text = CS.toVerilog(p, CS.allIssues(p));
+      eq(/WARNING: the sketch still had 2 must-fix problems when this was written\. 2 of them marked as "Not a problem"\./.test(text), true, 'verilog');
+    });
+    test('specs with nothing hidden have no hidden section', () => {
+      const p = CS.createProject('T', 'sky130', 'micro');
+      eq(CS.toMarkdown(p, CS.runChecks(p), CS.hiddenIssues(p)).includes('Hidden problems'), false);
+    });
+
+    const nastyProject = () => {
+      const p = bare();
+      CS.createBlock(p, 'custom', 0, 0, { name: '[notes](http://127.0.0.1:9/)' });
+      CS.createFeature(p, '<img src="http://127.0.0.1:9/p.png">');
+      CS.createFeature(p, '![x](http://127.0.0.1:9/q.png)');
+      CS.createFeature(p, 'a\\|b', null, { test: 'one\u2028two <script src=x>' });
+      p.name = '<b>chip</b>';
+      return p;
+    };
+    test('the spec keeps project text as plain text', () => {
+      const p = nastyProject();
+      const md = CS.toMarkdown(p, CS.runChecks(p));
+      ['<img', '<b>', '<script', '](http', '![x]'].forEach((raw) => eq(md.includes(raw), false, raw));
+      eq(md.includes('&lt;img src='), true, 'tag shown as text');
+      eq(md.includes('\\[notes\\]\\(http'), true, 'link shown as text');
+      eq(md.includes('\u2028'), false, 'separator removed');
+    });
+    test('a pipe in a name cannot break a table row', () => {
+      const p = bare();
+      CS.createBlock(p, 'custom', 0, 0, { name: 'a|b\\|c' });
+      const md = CS.toMarkdown(p, []);
+      const header = md.split('\n').find((l) => l.startsWith('| Name | Kind'));
+      const row = md.split('\n').find((l) => l.includes('&#124;'));
+      eq(!!row, true, 'pipe encoded');
+      eq(row.split('|').length, header.split('|').length, 'same columns');
+    });
+
+    const portsOf = (p) => readVerilog(CS.toVerilog(p, [])).get(CS.identifier(p.name)).ports;
+    test('every Verilog clock has exactly one SDC constraint, even when names collide', () => {
+      const p = CS.createProject('Clash', 'sky130', 'blank');
+      p.clocks = [{ id: 'c1', name: 'clk a', mhz: 100 }, { id: 'c2', name: 'clk_a', mhz: 1 }, { id: 'c3', name: 'clk-a', mhz: 5 }];
+      p.blocks = [];
+      p.clocks.forEach((c, i) => CS.createBlock(p, 'custom', i * 300, 0, { clock: c.id }));
+      const sdc = CS.toSdc(p);
+      const inputs = [...portsOf(p).keys()].filter((name) => name.startsWith('clk'));
+      eq(inputs.join(), 'clk_a,clk_a_2,clk_a_3', 'distinct ports');
+      inputs.forEach((name) => {
+        const pattern = new RegExp(`create_clock -name ${name} -period [0-9.]+ \\[get_ports ${name}\\]`, 'g');
+        eq((sdc.match(pattern) || []).length, 1, name);
+      });
+      eq(sdc.includes('-period 10.000 [get_ports clk_a]'), true, 'first keeps its speed');
+      eq(sdc.includes('-period 1000.000 [get_ports clk_a_2]'), true, 'second keeps its speed');
+      eq(sdc.includes('-group {clk_a} -group {clk_a_2} -group {clk_a_3}'), true, 'groups');
+    });
+
+    /* ---------- Robustness fixes ---------- */
+
+    test('a generated id cannot repeat an id already in the file', () => {
+      const p = CS.normalize({
+        version: 2,
+        target: 'sky130',
+        clocks: [{ id: 'c1', name: 'clk', mhz: 25 }],
+        blocks: [
+          { id: 'bx1', type: 'uart', clock: 'c1' },
+          { type: 'uart', clock: 'c1' },
+          { id: 'c', type: 'cpu', clock: 'c1' },
+        ],
+        links: [{ from: 'c', to: 'bx1' }],
+      });
+      const ids = p.blocks.map((b) => b.id);
+      eq(new Set(ids).size, 3, `all different: ${ids}`);
+      eq(CS.runChecks(p).some((i) => i.rule === 'orphan' && i.target.id === ids[1]), true, 'twin is reported');
+    });
+    test('new ids skip any id the file already uses', () => {
+      const p = CS.normalize({
+        version: 2,
+        nextId: 1000,
+        target: 'sky130',
+        clocks: [{ id: 'c1', name: 'clk', mhz: 25 }],
+        blocks: [{ id: 'b1001', type: 'custom', clock: 'c1' }, { id: 'x', type: 'custom', clock: 'c1', ports: [{ id: 'b1002', name: 'a', dir: 'in', width: 1 }] }],
+      });
+      const added = CS.createBlock(p, 'uart');
+      eq(added.id, 'b1003', 'skipped both taken ids');
+      eq(added.ports.every((x) => x.id !== 'b1001' && x.id !== 'b1002'), true, 'ports too');
+    });
+    test('a huge saved counter still gives different ids', () => {
+      const p = CS.normalize({ version: 2, nextId: 9007199254740992, target: 'sky130' });
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      eq(a.id === b.id, false, 'different');
+      CS.removeBlock(p, a.id);
+      eq(p.blocks.length, 1, 'deleting one leaves the other');
+    });
+    test('array values cannot pass as enum values', () => {
+      const p = CS.normalize({
+        version: 2,
+        target: ['sky130'],
+        clocks: [{ id: 'c1', name: 'a', mhz: 25 }, { id: 'c2', name: 'b', mhz: 25 }],
+        blocks: [
+          { id: 'x', type: ['memory'], clock: 'c1', ports: [{ id: 'p1', name: 'o', dir: ['out'], width: 1 }] },
+          { id: 'y', type: 'bus', protocol: ['axi'], clock: 'c2' },
+        ],
+        links: [{ id: 'l', from: 'x', to: 'y', fromPort: 'p1', crossing: ['none'], protocol: ['axi'] }],
+      });
+      eq(p.target, 'tt', 'target');
+      eq(p.blocks[0].type, 'custom', 'type');
+      eq(p.blocks[0].ports[0].dir, 'in', 'dir');
+      eq(p.blocks[1].protocol, 'axi-lite', 'bus protocol');
+      eq(p.links[0].crossing, 'none', 'crossing is a string');
+      eq(typeof p.links[0].protocol, 'string', 'link protocol');
+      eq(CS.runChecks(p).some((i) => i.rule === 'cdc-unhandled'), true, 'the must-fix is raised');
+    });
+
+    function combChain(count, closed) {
+      const blocks = [];
+      const links = [];
+      for (let i = 0; i < count; i += 1) blocks.push({ id: `n${i}` });
+      for (let i = 0; i < count - 1; i += 1) links.push({ id: `l${i}`, from: `n${i}`, to: `n${i + 1}`, comb: true });
+      if (closed) links.push({ id: 'back', from: `n${count - 1}`, to: 'n0', comb: true });
+      return { blocks, links };
+    }
+    test('the loop search survives a chain far longer than the call stack', () => {
+      eq(CS.findCombLoop(combChain(200000, false)), null, 'open chain');
+      eq(CS.findCombLoop(combChain(200000, true)).length, 200000, 'closed chain');
+    });
+    test('the loop search returns only the links in the loop', () => {
+      const p = {
+        blocks: [{ id: 'lead' }, { id: 'a' }, { id: 'b' }],
+        links: [
+          { id: 'in', from: 'lead', to: 'a', comb: true },
+          { id: 'ab', from: 'a', to: 'b', comb: true },
+          { id: 'ba', from: 'b', to: 'a', comb: true },
+        ],
+      };
+      eq(CS.findCombLoop(p).map((l) => l.id).join(), 'ab,ba');
+    });
+    test('fixing a reported loop really breaks it, even with a wire leading into it', () => {
+      const p = bare();
+      const lead = CS.createBlock(p, 'custom');
+      const a = CS.createBlock(p, 'custom');
+      const b = CS.createBlock(p, 'custom');
+      CS.createLink(p, lead.id, a.id, { comb: true });
+      CS.createLink(p, a.id, b.id, { comb: true });
+      CS.createLink(p, b.id, a.id, { comb: true });
+      const issue = CS.runChecks(p).find((i) => i.rule === 'comb-loop');
+      CS.applyFix(p, issue.fix);
+      eq(CS.runChecks(p).some((i) => i.rule === 'comb-loop'), false, 'gone after one fix');
+    });
+    test('block ids named after built-ins are treated like any other id', () => {
+      ['constructor', 'toString', '__proto__', 'hasOwnProperty'].forEach((id) => {
+        const p = {
+          blocks: [{ id }, { id: 'other' }],
+          links: [
+            { id: 'a', from: id, to: 'other', comb: true },
+            { id: 'b', from: 'other', to: id, comb: true },
+          ],
+        };
+        eq(CS.findCombLoop(p).length, 2, id);
+      });
+    });
+    test('a long loop gets a short message', () => {
+      const p = bare();
+      const blocks = [];
+      for (let i = 0; i < 20; i += 1) blocks.push(CS.createBlock(p, 'custom'));
+      blocks.forEach((b, i) => CS.createLink(p, b.id, blocks[(i + 1) % 20].id, { comb: true, fromPort: b.ports[1].id, toPort: blocks[(i + 1) % 20].ports[0].id }));
+      const issue = CS.runChecks(p).find((i) => i.rule === 'comb-loop');
+      eq(issue.plainTitle.includes('and 14 more'), true, issue.plainTitle);
+    });
+
+    const failed = results.filter((r) => !r.ok);
+    document.getElementById('summary').textContent = failed.length
+      ? `${failed.length} of ${results.length} failed`
+      : `All ${results.length} tests passed`;
+    document.getElementById('summary').className = failed.length ? 'fail' : 'pass';
+    document.getElementById('out').innerHTML = results.map((r) => {
+      const li = document.createElement('li');
+      li.className = r.ok ? 'pass' : 'fail';
+      li.textContent = r.ok ? r.name : `${r.name}: ${r.message}`;
+      return li.outerHTML;
+    }).join('');
+    window.testResults = results;
+  </script>
+</body>
+</html>

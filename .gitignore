@@ -1,0 +1,12 @@
+# ChipSketch has no build step, so there is little to ignore.
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# Exports and project files made while trying the app
+*.chipsketch.json
+*_spec.md
+*_top.v
+*.sdc
